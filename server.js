@@ -151,30 +151,52 @@ async function createCaptchaImage(code) {
   const canvas = createCanvas(width, height);
   const ctx = canvas.getContext('2d');
 
+  // Step 1: Set background color to white
   ctx.fillStyle = 'white';
   ctx.fillRect(0, 0, width, height);
 
+  // Step 2: Generate random text color
   const textColor = `rgb(${Math.floor(Math.random() * 150)}, ${Math.floor(Math.random() * 100)}, ${Math.floor(Math.random() * 150)})`;
+  console.log('Generated text color:', textColor);  // Log text color for debugging
   ctx.fillStyle = textColor;
 
-  ctx.font = '32px Arial';
+  // Step 3: Set font and calculate position of the text
+  ctx.font = '32px Arial';  // Ensure Arial font is available
   const textWidth = ctx.measureText(code).width;
   const x = (width - textWidth) / 2;
   const y = height / 2 + 10;
-  ctx.fillText(code, x, y);
 
-  // Convert canvas to a buffer
-  const captchaBuffer = canvas.toBuffer();
+  console.log(`Captcha code: ${code}`);
+  console.log(`Text width: ${textWidth}, X position: ${x}, Y position: ${y}`);
 
+  // Step 4: Draw the text on the canvas
   try {
-    // Upload to Cloudinary
+    ctx.fillText(code, x, y);
+  } catch (error) {
+    console.error('Error while rendering captcha text:', error);
+  }
+
+  // Step 5: Convert canvas to a buffer
+  let captchaBuffer;
+  try {
+    captchaBuffer = canvas.toBuffer();
+    console.log('Captcha buffer generated, size:', captchaBuffer.length);  // Log buffer size for debugging
+  } catch (error) {
+    console.error('Error while converting canvas to buffer:', error);
+    return null;
+  }
+
+  // Step 6: Upload to Cloudinary
+  try {
     const result = await new Promise((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
         { resource_type: 'image' },
         (error, result) => {
           if (error) {
-            reject('Cloudinary upload failed: ' + error.message);
+            console.error('Cloudinary upload failed:', error.message);  // Log upload failure
+            reject(error);
           } else {
+            console.log('Cloudinary upload succeeded:', result);  // Log successful upload
             resolve(result);
           }
         }
@@ -182,19 +204,19 @@ async function createCaptchaImage(code) {
       stream.end(captchaBuffer);  // End stream with the image buffer
     });
 
-    // Log the result for debugging
-    console.log('Cloudinary upload result:', result);
-
+    // Step 7: Return the result from Cloudinary
     if (result && result.url) {
+      console.log('Cloudinary URL:', result.url);  // Log the URL for debugging
       return result;  // Return the Cloudinary result containing the URL and public_id
     } else {
       throw new Error('Cloudinary upload returned empty result.');
     }
   } catch (error) {
-    console.error('Error in createCaptchaImage:', error);  // Log error for debugging
+    console.error('Error in createCaptchaImage:', error);  // Log any error in the image creation/upload process
     return null;
   }
 }
+
 
 
 const inlineKeyboard = [];
