@@ -3,10 +3,20 @@ const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const { createCanvas } = require('canvas');
 const path = require('path');
+const cloudinary = require('cloudinary').v2;
+
+
 
 const ACTION_LOG_FILE = process.env.ACTION_LOG_FILE;
 const SUBSCRIBERS_FILE = process.env.SUBSCRIBERS_FILE;
 const ADMINS_FILE = process.env.ADMINS_FILE;
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
 
 function logUserAction(userId, action) {
     const logEntry = {
@@ -36,7 +46,9 @@ let subscribedUsers = loadSubscribers();
 let activeInviteLinks = {};
 let adminIds = loadAdmins();
 
-
+const captchaTimeout = 5 * 60 * 1000;  // 10 minutes
+const maxAttempts = 3;
+const userAttempts = {};
 
 const bot = new TelegramBot(BOT_TOKEN, {
   polling: true,
@@ -118,12 +130,22 @@ function removeAdmins(adminIds) {
   }
 }
 
+async function deleteCaptchaImage(publicId) {
+  try {
+    const result = await cloudinary.uploader.destroy(publicId);
+    console.log('Captcha image deleted:', result);
+  } catch (error) {
+    console.error('Error deleting image from Cloudinary:', error);
+  }
+}
+
 function generateCaptchaCode(length = 5) {
   const digits = '0123456789';
   return Array.from({ length }, () => digits[Math.floor(Math.random() * digits.length)]).join('');
 }
 
-function createCaptchaImage(code) {
+
+async function createCaptchaImage(code) {
   const width = 200;
   const height = 60;
   const canvas = createCanvas(width, height);
@@ -141,113 +163,198 @@ function createCaptchaImage(code) {
   const y = height / 2 + 10;
   ctx.fillText(code, x, y);
 
-  return canvas.toBuffer();
+  // Convert canvas to a buffer
+  const captchaBuffer = canvas.toBuffer();
+
+  try {
+    // Upload to Cloudinary
+    const result = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { resource_type: 'image' },
+        (error, result) => {
+          if (error) {
+            reject('Cloudinary upload failed: ' + error.message);
+          } else {
+            resolve(result);
+          }
+        }
+      );
+      stream.end(captchaBuffer);  // End stream with the image buffer
+    });
+
+    // Log the result for debugging
+    console.log('Cloudinary upload result:', result);
+
+    if (result && result.url) {
+      return result;  // Return the Cloudinary result containing the URL and public_id
+    } else {
+      throw new Error('Cloudinary upload returned empty result.');
+    }
+  } catch (error) {
+    console.error('Error in createCaptchaImage:', error);  // Log error for debugging
+    return null;
+  }
 }
+
 
 const inlineKeyboard = [];
 
 bot.onText(/\/start/, async (msg) => {
   const userId = msg.from.id;
+
+  // Check if the user has exceeded the max attempts
+  if (userAttempts[userId] && userAttempts[userId].count >= maxAttempts) {
+    return bot.sendMessage(userId, '❌ You have reached the maximum number of attempts. Please try again later.');
+  }
+
   subscribedUsers.add(userId);
   saveSubscribers(subscribedUsers);
 
+  // Send "Processing" message with a dynamic emoji
+  const processingMessage = await bot.sendMessage(userId, '🔄 Processing your request... Please wait.');
+
   const code = generateCaptchaCode();
-  userCaptchaData[userId] = { code, attempts: 0 };
+  userCaptchaData[userId] = { code, attempts: 0, timestamp: Date.now() };  // Add timestamp for timeout check
 
-  const captchaImageBuffer = createCaptchaImage(code);
-  const captchaFilePath = path.join(__dirname, 'captcha_image.jpg');
+  try {
+    const result = await createCaptchaImage(code);  // Get Cloudinary result containing the URL and public_id
+    const captchaImageURL = result?.url;
+    const captchaPublicID = result?.public_id;  // Store the public_id
 
-  fs.writeFileSync(captchaFilePath, captchaImageBuffer);
-
-  const options = [];
-  let correctOptionIndex = Math.floor(Math.random() * 9);
-  for (let i = 0; i < 9; i++) {
-    if (i === correctOptionIndex) {
-      options.push(code);
-    } else {
-      options.push(generateCaptchaCode(5));
+    if (!captchaImageURL || !captchaPublicID) {
+      await bot.deleteMessage(userId, processingMessage.message_id);
+      return bot.sendMessage(userId, '❌ Error generating captcha image. Please try again later.');
     }
+
+    // Delete the "Processing" message once the captcha is ready
+    await bot.deleteMessage(userId, processingMessage.message_id);
+
+    const options = [];
+    let correctOptionIndex = Math.floor(Math.random() * 9);
+    for (let i = 0; i < 9; i++) {
+      if (i === correctOptionIndex) {
+        options.push(code);
+      } else {
+        options.push(generateCaptchaCode(5));
+      }
+    }
+
+    inlineKeyboard.length = 0;
+    const row1 = options.slice(0, 3).map((option, index) => ({
+      text: option,
+      callback_data: `captcha_option_${index}_${option}`,
+    }));
+    const row2 = options.slice(3, 6).map((option, index) => ({
+      text: option,
+      callback_data: `captcha_option_${index + 3}_${option}`,
+    }));
+    const row3 = options.slice(6, 9).map((option, index) => ({
+      text: option,
+      callback_data: `captcha_option_${index + 6}_${option}`,
+    }));
+
+    inlineKeyboard.push(row1, row2, row3);
+
+    // Send captcha options with image
+    bot.sendPhoto(userId, captchaImageURL, {
+      caption: 'Select the correct captcha code from the options below:',
+      reply_markup: JSON.stringify({
+        inline_keyboard: inlineKeyboard,
+      }),
+    });
+
+    // Store the public_id for future deletion
+    userCaptchaData[userId].captchaPublicID = captchaPublicID;
+  } catch (error) {
+    await bot.deleteMessage(userId, processingMessage.message_id);
+    bot.sendMessage(userId, '❌ Error generating captcha image. Please try again later.');
   }
-
-  inlineKeyboard.length = 0;
-
-  const row1 = options.slice(0, 3).map((option, index) => ({
-    text: option,
-    callback_data: `captcha_option_${index}_${option}`,
-  }));
-  const row2 = options.slice(3, 6).map((option, index) => ({
-    text: option,
-    callback_data: `captcha_option_${index + 3}_${option}`,
-  }));
-  const row3 = options.slice(6, 9).map((option, index) => ({
-    text: option,
-    callback_data: `captcha_option_${index + 6}_${option}`,
-  }));
-
-  inlineKeyboard.push(row1, row2, row3);
-
-  bot.sendPhoto(userId, captchaFilePath, {
-    caption: 'Select the correct captcha code from the options below:',
-    reply_markup: JSON.stringify({
-      inline_keyboard: inlineKeyboard,
-    }),
-  });
 });
+
+
 
 bot.on('callback_query', async (callbackQuery) => {
-    const userId = callbackQuery.from.id;
-    const callbackData = callbackQuery.data;
+  const userId = callbackQuery.from.id;
+  const callbackData = callbackQuery.data;
 
-    console.log('Callback received:', callbackData);
-    logUserAction(userId, `Pressed button with data: ${callbackData}`);
+  console.log('Callback received:', callbackData);
+  logUserAction(userId, `Pressed button with data: ${callbackData}`);
 
-    const parts = callbackData.split('_');
-    if (parts.length !== 4 || parts[0] !== 'captcha' || parts[1] !== 'option') {
-        bot.sendMessage(userId, '❌ Invalid captcha response. Please try again.');
-        return;
-    }
+  const parts = callbackData.split('_');
+  if (parts.length !== 4 || parts[0] !== 'captcha' || parts[1] !== 'option') {
+    bot.sendMessage(userId, '❌ Invalid captcha response. Please try again.');
+    return;
+  }
 
-    const selectedCode = parts[3];
-    const captchaInfo = userCaptchaData[userId];
+  const selectedCode = parts[3];
+  const captchaInfo = userCaptchaData[userId];
 
-    if (!captchaInfo) {
-        bot.sendMessage(userId, '❌ No active captcha session. Please restart the process.');
-        return;
-    }
+  if (!captchaInfo) {
+    bot.sendMessage(userId, '❌ No active captcha session. Please restart the process.');
+    return;
+  }
 
-    const { code } = captchaInfo;
-    if (selectedCode === code) {
-        bot.sendMessage(userId, '✅ Correct!');
-        delete userCaptchaData[userId];
+  const { code, attempts, captchaPublicID } = captchaInfo;
 
-        const channelInvite = await generateTimeLimitedLink();
-        if (channelInvite) {
-            activeInviteLinks[userId] = channelInvite;
+  // Check if the user selected the correct code
+  if (selectedCode === code) {
+    bot.sendMessage(userId, '✅ Correct!');
 
-            bot.sendMessage(userId, `Here is your **unique** invite link (valid for 1 minute):`, {
-                reply_markup: JSON.stringify({
-                    inline_keyboard: [[{ text: 'Join Channel', url: channelInvite }]],
-                }),
-                parse_mode: 'Markdown',
-            });
+    // Clear the captcha session
+    delete userCaptchaData[userId];
 
-            setTimeout(async () => {
-                await revokeInviteLink(channelInvite);
-                delete activeInviteLinks[userId];
-            }, 60000);
-        } else {
-            bot.sendMessage(userId, '❌ An error occurred while generating the invite link. Please contact the admin.');
-        }
+    // Delete the captcha image from Cloudinary after solving
+    await deleteCaptchaImage(captchaPublicID);
+
+    // Generate and send a time-limited invite link
+    const channelInvite = await generateTimeLimitedLink();
+    if (channelInvite) {
+      activeInviteLinks[userId] = channelInvite;
+
+      bot.sendMessage(userId, `Here is your **unique** invite link (valid for 1 minute):`, {
+        reply_markup: JSON.stringify({
+          inline_keyboard: [[{ text: 'Join Channel', url: channelInvite }]],
+        }),
+        parse_mode: 'Markdown',
+      });
+
+      // Revoke the invite link after 1 minute
+      setTimeout(async () => {
+        await revokeInviteLink(channelInvite);
+        delete activeInviteLinks[userId];
+      }, 60000);
     } else {
-        captchaInfo.attempts++;
-        if (captchaInfo.attempts >= 3) {
-            bot.sendMessage(userId, '❌ You have exceeded the maximum attempts. Please try again later.');
-            delete userCaptchaData[userId];
-        } else {
-            bot.sendMessage(userId, '❌ Incorrect. Try again.');
-        }
+      bot.sendMessage(userId, '❌ An error occurred while generating the invite link. Please contact the admin.');
     }
+  } else {
+    // Increment attempts and handle max attempts logic
+    captchaInfo.attempts++;
+    if (captchaInfo.attempts >= 3) {
+      bot.sendMessage(userId, '❌ You have exceeded the maximum attempts. Please try again later.');
+
+      // Delete captcha data after max attempts
+      await deleteCaptchaImage(captchaPublicID);  // Delete the image after max attempts
+      delete userCaptchaData[userId];
+    } else {
+      bot.sendMessage(userId, `❌ Incorrect. You have ${3 - captchaInfo.attempts} attempts left.`);
+    }
+  }
 });
+
+// Delete expired captchas and images every minute
+setInterval(() => {
+  Object.keys(userCaptchaData).forEach(async (userId) => {
+    const data = userCaptchaData[userId];
+    if (Date.now() - data.timestamp > captchaTimeout) {
+      // Timeout occurred, delete the captcha image
+      await deleteCaptchaImage(data.captchaPublicID);  // Delete the image
+      delete userCaptchaData[userId];  // Expired captcha
+
+      bot.sendMessage(userId, '❌ Your captcha has expired. Please generate a new one.');
+    }
+  });
+}, 60000);  // Check every minute
+
 
 bot.onText(/\/help/, (msg) => {
     const userId = msg.from.id;
