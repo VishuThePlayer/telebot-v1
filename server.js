@@ -4,6 +4,8 @@ const fs = require('fs');
 const { createCanvas } = require('canvas');
 const path = require('path');
 const cloudinary = require('cloudinary').v2;
+const fontPath = path.join(__dirname, 'arial.ttf');
+
 
 
 
@@ -161,7 +163,7 @@ async function createCaptchaImage(code) {
   ctx.fillStyle = textColor;
 
   // Step 3: Set font and calculate position of the text
-  ctx.font = '32px Arial';  // Ensure Arial font is available
+  ctx.font = `32px ${fontPath}`;
   const textWidth = ctx.measureText(code).width;
   const x = (width - textWidth) / 2;
   const y = height / 2 + 10;
