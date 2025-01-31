@@ -4,7 +4,15 @@ const fs = require('fs');
 const { createCanvas } = require('canvas');
 const path = require('path');
 const cloudinary = require('cloudinary').v2;
+// Set up the font path (make sure you have the correct font file)
 const fontPath = path.join(__dirname, 'arial.ttf');
+
+// Check if the font file exists and log for debugging
+if (fs.existsSync(fontPath)) {
+  console.log('Font file found:', fontPath);
+} else {
+  console.log('Font file not found, using default font');
+}
 
 
 
@@ -163,7 +171,10 @@ async function createCaptchaImage(code) {
   ctx.fillStyle = textColor;
 
   // Step 3: Set font and calculate position of the text
-  ctx.font = `32px ${fontPath}`;
+  // Ensure the font path is correct and registered
+  ctx.addFont(fontPath, 'Arial');  // Register the font explicitly
+  ctx.font = `32px Arial`;  // Use the Arial font or the font you loaded
+
   const textWidth = ctx.measureText(code).width;
   const x = (width - textWidth) / 2;
   const y = height / 2 + 10;
@@ -218,6 +229,7 @@ async function createCaptchaImage(code) {
     return null;
   }
 }
+
 
 
 
